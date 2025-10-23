@@ -4,12 +4,16 @@ class TradingDashboard {
         this.chart = null;
         this.refreshInterval = 5000; // 5秒刷新一次
         this.darkMode = false; // 默认白天模式
+        this.currentTimeFilter = 'all'; // 当前时间筛选：1d, 1w, 1m, 3m, all
         this.init();
     }
 
     async init() {
         // 初始化主题
         this.initTheme();
+
+        // 初始化时间筛选按钮
+        this.initTimeFilters();
 
         // 检查登录状态
         await this.checkLoginStatus();
@@ -26,6 +30,40 @@ class TradingDashboard {
 
         // 页脚自动显示/隐藏
         this.initFooterAutoHide();
+    }
+
+    initTimeFilters() {
+        // 为时间筛选按钮添加事件监听
+        const filterButtons = document.querySelectorAll('.filter-btn');
+        filterButtons.forEach(btn => {
+            btn.addEventListener('click', (e) => {
+                e.preventDefault();
+
+                // 移除所有按钮的active状态
+                filterButtons.forEach(b => b.classList.remove('active'));
+
+                // 添加当前按钮的active状态
+                btn.classList.add('active');
+
+                // 获取时间筛选值
+                const timeFilter = btn.textContent.trim();
+                this.currentTimeFilter = this.mapTimeFilterToValue(timeFilter);
+
+                // 重新加载图表数据
+                this.loadPerformanceChart();
+            });
+        });
+    }
+
+    mapTimeFilterToValue(filterText) {
+        const mapping = {
+            '1天': '1d',
+            '1周': '1w',
+            '1月': '1m',
+            '3月': '3m',
+            '全部': 'all'
+        };
+        return mapping[filterText] || 'all';
     }
 
     initFooterAutoHide() {
@@ -162,7 +200,9 @@ class TradingDashboard {
 
     async loadPerformanceChart() {
         try {
-            const response = await fetch('/api/dashboard/performance-chart');
+            // 添加时间筛选参数
+            const url = `/api/dashboard/performance-chart?timeFilter=${this.currentTimeFilter}`;
+            const response = await fetch(url);
             const data = await response.json();
 
             console.log('[DEBUG] Performance chart data:', data);
@@ -201,12 +241,26 @@ class TradingDashboard {
             '#3370FF', '#F7BA1E', '#9FDB1D', '#FF6B6B', '#4ECDC4', '#95E1D3', '#F38181'
         ];
 
-        const series = data.map((model, index) => ({
-            name: model.model_name,
-            type: 'line',
-            data: model.data.map(d => [new Date(d.time).getTime(), d.value]),  // 转换为时间戳
-            smooth: true,
-            smoothMonotone: 'x',  // 平滑曲线
+        // 计算所有收益率数据，用于动态设置Y轴范围
+        let allReturnRates = [];
+
+        const series = data.map((model, index) => {
+            // 使用每个模型的真实初始资金，如果没有则使用10000作为默认值
+            const initialCapital = model.initial_capital || 10000;
+
+            const modelData = model.data.map(d => {
+                const returnRate = ((d.value - initialCapital) / initialCapital) * 100;
+                allReturnRates.push(returnRate);
+                return [new Date(d.time).getTime(), returnRate, d.value];
+            });
+
+            return {
+                name: model.model_name,
+                type: 'line',
+                // 转换数据：[时间戳, 收益率, 原始市值]
+                data: modelData,
+                smooth: true,
+                smoothMonotone: 'x',  // 平滑曲线
             showSymbol: false,  // 默认不显示数据点，鼠标悬停时显示
             symbol: 'circle',
             symbolSize: 8,
@@ -233,7 +287,9 @@ class TradingDashboard {
             endLabel: {
                 show: true,
                 formatter: function (params) {
-                    return `${params.seriesName}\n$${params.value[1].toLocaleString()}`;
+                    const returnRate = params.value[1];
+                    const sign = returnRate >= 0 ? '+' : '';
+                    return `${params.seriesName}\n${sign}${returnRate.toFixed(2)}%`;
                 },
                 fontSize: 11,
                 fontWeight: 'bold',
@@ -255,7 +311,31 @@ class TradingDashboard {
                     }]
                 }
             }
-        }));
+            };
+        });
+
+        // 动态计算Y轴范围
+        const minReturn = Math.min(...allReturnRates);
+        const maxReturn = Math.max(...allReturnRates);
+        const range = maxReturn - minReturn;
+
+        // 添加padding，让图表更美观
+        const padding = Math.max(range * 0.1, 2); // 至少2%的padding
+        const yMin = Math.floor((minReturn - padding) / 5) * 5; // 向下取整到5的倍数
+        const yMax = Math.ceil((maxReturn + padding) / 5) * 5;  // 向上取整到5的倍数
+
+        // 动态计算刻度间隔
+        const yRange = yMax - yMin;
+        let interval;
+        if (yRange <= 10) {
+            interval = 1;  // 1%间隔
+        } else if (yRange <= 20) {
+            interval = 2;  // 2%间隔
+        } else if (yRange <= 50) {
+            interval = 5;  // 5%间隔
+        } else {
+            interval = 10; // 10%间隔
+        }
 
         const option = {
             backgroundColor: 'transparent',
@@ -283,11 +363,14 @@ class TradingDashboard {
                     params.forEach(param => {
                         const color = param.color;
                         const name = param.seriesName;
-                        const value = param.value[1];
+                        const returnRate = param.value[1];  // 收益率
+                        const marketValue = param.value[2]; // 原始市值
+                        const sign = returnRate >= 0 ? '+' : '';
                         result += `<div style="margin: 4px 0;">
                             <span style="display: inline-block; width: 10px; height: 10px; border-radius: 50%; background: ${color}; margin-right: 8px;"></span>
-                            <span style="font-weight: 600;">${name}:</span>
-                            <span style="color: ${color}; font-weight: bold;">$${value.toLocaleString()}</span>
+                            <span style="font-weight: 600;">${name}:</span><br/>
+                            <span style="margin-left: 18px; color: ${color}; font-weight: bold;">市值: $${marketValue.toLocaleString()}</span><br/>
+                            <span style="margin-left: 18px; color: ${returnRate >= 0 ? '#00b578' : '#ff4d4f'}; font-weight: bold;">收益率: ${sign}${returnRate.toFixed(2)}%</span>
                         </div>`;
                     });
                     return result;
@@ -305,39 +388,67 @@ class TradingDashboard {
                 boundaryGap: false,
                 axisLine: {
                     lineStyle: {
-                        color: this.darkMode ? '#333' : '#e0e0e0'
+                        color: this.darkMode ? '#fff' : '#000',  // 专业风格：黑色实线
+                        width: 2  // 加粗
                     }
                 },
                 splitLine: {
                     show: true,
+                    interval: 4,  // 每隔5个刻度显示一条线，避免密集恐惧症
                     lineStyle: {
-                        color: this.darkMode ? 'rgba(255, 255, 255, 0.05)' : 'rgba(0, 0, 0, 0.05)',
-                        type: 'dashed',  // 虚线
+                        color: this.darkMode ? 'rgba(255, 255, 255, 0.08)' : 'rgba(0, 0, 0, 0.08)',  // 更浅的颜色，更干净
+                        type: 'solid',
                         width: 1
                     }
                 },
                 axisLabel: {
-                    color: this.darkMode ? '#999' : '#666'
+                    color: this.darkMode ? '#fff' : '#000',  // 专业风格：黑色文字
+                    fontWeight: 'bold',
+                    fontFamily: 'Courier New, monospace'
                 }
             },
             yAxis: {
                 type: 'value',
+                min: yMin,
+                max: yMax,
+                interval: interval,
                 axisLabel: {
-                    formatter: '${value}',
-                    color: this.darkMode ? '#999' : '#666'
+                    formatter: function(value) {
+                        const sign = value >= 0 ? '+' : '';
+                        return sign + value.toFixed(0) + '%';
+                    },
+                    color: this.darkMode ? '#fff' : '#000',  // 专业风格：黑色文字
+                    fontWeight: 'bold',
+                    fontFamily: 'Courier New, monospace'
                 },
                 axisLine: {
                     lineStyle: {
-                        color: this.darkMode ? '#333' : '#e0e0e0'
+                        color: this.darkMode ? '#fff' : '#000',  // 专业风格：黑色实线
+                        width: 2  // 加粗
                     }
                 },
                 splitLine: {
+                    show: true,
+                    interval: 4,  // 每隔5个刻度显示一条线，避免密集恐惧症
                     lineStyle: {
-                        color: this.darkMode ? 'rgba(255, 255, 255, 0.05)' : 'rgba(0, 0, 0, 0.05)',
-                        type: 'dashed',  // 虚线
+                        color: this.darkMode ? 'rgba(255, 255, 255, 0.08)' : 'rgba(0, 0, 0, 0.08)',  // 更浅的颜色，更干净
+                        type: 'solid',
                         width: 1
                     }
-                }
+                },
+                // 添加0%基准线（如果0在范围内）
+                markLine: yMin <= 0 && yMax >= 0 ? {
+                    silent: true,
+                    data: [{
+                        yAxis: 0,
+                        lineStyle: {
+                            color: this.darkMode ? '#666' : '#999',
+                            type: 'solid',
+                            width: 1,
+                            opacity: 0.6
+                        }
+                    }]
+                } : null
             },
             series: series
         };
@@ -497,8 +608,7 @@ class TradingDashboard {
                 document.getElementById('winningModelPositions').textContent = winner.trades;
             }
 
-            // 渲染柱状图
-            this.renderStatsChart(data.slice(0, 6));
+            // 柱状图已移除
         } catch (error) {
             console.error('Failed to load detailed leaderboard:', error);
         }
@@ -581,68 +691,7 @@ class TradingDashboard {
         return '📊';
     }
 
-    renderStatsChart(data) {
-        const chartDom = document.getElementById('statsChart');
-        const myChart = echarts.init(chartDom);
-
-        const option = {
-            grid: {
-                left: '3%',
-                right: '4%',
-                bottom: '3%',
-                top: '10%',
-                containLabel: true
-            },
-            tooltip: {
-                trigger: 'axis',
-                axisPointer: {
-                    type: 'shadow'
-                },
-                formatter: function (params) {
-                    const value = params[0].value;
-                    const sign = value >= 0 ? '+' : '';
-                    return `${params[0].name}<br/>收益率: ${sign}${value.toFixed(2)}%`;
-                }
-            },
-            xAxis: {
-                type: 'category',
-                data: data.map(m => m.name),
-                axisLabel: {
-                    rotate: 45,
-                    fontSize: 10
-                }
-            },
-            yAxis: {
-                type: 'value',
-                axisLabel: {
-                    formatter: function (value) {
-                        const sign = value >= 0 ? '+' : '';
-                        return sign + value.toFixed(1) + '%';
-                    }
-                }
-            },
-            series: [{
-                data: data.map((m, i) => ({
-                    value: m.return_pct,  // 改为收益率
-                    itemStyle: {
-                        color: m.return_pct >= 0 ? '#00b578' : '#ff4d4f'  // 正收益绿色，负收益红色
-                    }
-                })),
-                type: 'bar',
-                barWidth: '60%',
-                label: {
-                    show: true,
-                    position: 'top',
-                    formatter: function (params) {
-                        const sign = params.value >= 0 ? '+' : '';
-                        return sign + params.value.toFixed(2) + '%';
-                    }
-                }
-            }]
-        };
-
-        myChart.setOption(option);
-    }
+    // renderStatsChart 方法已移除 - 柱状图功能已删除
 
     bindStatsTabsEvents() {
         document.querySelectorAll('.stats-tab').forEach(tab => {

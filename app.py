@@ -20,6 +20,32 @@ app = Flask(__name__)
 app.secret_key = os.environ.get('SECRET_KEY', '8XRxYeeymuCa2URjWcg6AIKPo')
 CORS(app, supports_credentials=True)
 
+# 版本号用于缓存清理 - 使用当前时间戳
+import time
+APP_VERSION = str(int(time.time()))
+
+# 添加全局模板变量
+@app.context_processor
+def inject_version():
+    return {'app_version': APP_VERSION}
+
+# 设置缓存控制头
+@app.after_request
+def after_request(response):
+    # 对静态资源设置较短的缓存时间
+    if request.endpoint == 'static':
+        response.headers['Cache-Control'] = 'public, max-age=300'  # 5分钟
+    # 对API响应禁用缓存
+    elif request.path.startswith('/api/'):
+        response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
+        response.headers['Pragma'] = 'no-cache'
+        response.headers['Expires'] = '0'
+    # 对HTML页面设置较短缓存
+    elif response.content_type.startswith('text/html'):
+        response.headers['Cache-Control'] = 'no-cache, must-revalidate'
+        response.headers['Pragma'] = 'no-cache'
+    return response
+
 db = Database(config.DATABASE_PATH)
 market_fetcher = MarketDataFetcher()
 risk_manager = RiskManager(db)
@@ -913,9 +939,33 @@ def get_advanced_analytics():
 
 @app.route('/api/dashboard/performance-chart', methods=['GET'])
 def get_performance_chart():
-    """获取收益曲线图数据（公开API）- 前6名模型 + BTC基准"""
+    """获取收益曲线图数据（公开API）- 前10名+倒数2名模型 + BTC基准"""
     try:
-        # 获取排行榜前6名
+        # 获取时间筛选参数
+        time_filter = request.args.get('timeFilter', 'all')
+        print(f'[DEBUG] Time filter: {time_filter}')
+
+        # 计算时间范围
+        from datetime import datetime, timedelta
+        current_time = datetime.now()
+
+        if time_filter == '1d':
+            start_time = current_time - timedelta(days=1)
+        elif time_filter == '1w':
+            start_time = current_time - timedelta(weeks=1)
+        elif time_filter == '1m':
+            start_time = current_time - timedelta(days=30)
+        elif time_filter == '3m':
+            start_time = current_time - timedelta(days=90)
+        else:  # 'all'
+            # 系统实际运行时间：2025-10-21 13:00:00（东八区）
+            start_time = datetime(2025, 10, 21, 13, 0, 0) - timedelta(hours=8)  # 转换为UTC
+
+        # 转换为UTC时间字符串用于数据库查询
+        start_time_utc_str = start_time.strftime('%Y-%m-%d %H:%M:%S')
+        print(f'[DEBUG] Query start time (UTC): {start_time_utc_str}')
+
+        # 获取排行榜前10名+倒数2名
         models = db.get_all_models()
         leaderboard = []
 
@@ -942,23 +992,31 @@ def get_performance_chart():
                 'model_id': model['id'],
                 'model_name': model['name'],
                 'total_value': total_value,
-                'total_return': total_return
+                'total_return': total_return,
+                'initial_capital': model['initial_capital']  # 添加初始资金
             })
 
-        # 按收益率排序，取前6名
+        # 按收益率排序，取前10名+倒数2名
         leaderboard.sort(key=lambda x: x['total_return'], reverse=True)
-        top_models = leaderboard[:6]
+
+        # 选择要显示的模型：前10名 + 倒数2名
+        selected_models = []
+        total_models = len(leaderboard)
+
+        if total_models <= 12:
+            # 如果总数不超过12个，显示全部
+            selected_models = leaderboard
+        else:
+            # 前10名
+            selected_models.extend(leaderboard[:10])
+            # 倒数2名（避免重复）
+            selected_models.extend(leaderboard[-2:])
+
+        top_models = selected_models
 
         # 获取每个模型的历史账户价值数据
         result = []
         conn = db.get_connection()
-
-        # 系统实际运行时间：2025-10-21 13:00:00（东八区）
-        # 转换为UTC时间用于数据库查询
-        from datetime import datetime, timedelta
-        system_start_beijing = datetime(2025, 10, 21, 13, 0, 0)
-        system_start_utc = system_start_beijing - timedelta(hours=8)
-        system_start_utc_str = system_start_utc.strftime('%Y-%m-%d %H:%M:%S')
 
         for model in top_models:
             cursor = conn.cursor()
@@ -967,10 +1025,10 @@ def get_performance_chart():
                 FROM account_values
                 WHERE model_id = ? AND timestamp >= ?
                 ORDER BY timestamp ASC
-            ''', (model['model_id'], system_start_utc_str))
+            ''', (model['model_id'], start_time_utc_str))
 
             history = cursor.fetchall()
-            print(f'[DEBUG] Model {model["model_name"]} (ID:{model["model_id"]}): {len(history)} data points after filtering (>= {system_start_utc_str})')
+            print(f'[DEBUG] Model {model["model_name"]} (ID:{model["model_id"]}): {len(history)} data points after filtering (>= {start_time_utc_str})')
 
             data_points = []
             for row in history:
@@ -984,6 +1042,7 @@ def get_performance_chart():
             result.append({
                 'model_id': model['model_id'],
                 'model_name': model['model_name'],
+                'initial_capital': model['initial_capital'],  # 添加初始资金
                 'data': data_points
             })
 
@@ -1029,11 +1088,11 @@ def get_performance_chart():
                     # 字符串格式
                     hist_time_utc = datetime.strptime(timestamp, '%Y-%m-%d %H:%M:%S')
 
-                if hist_time_utc >= system_start_utc:
+                if hist_time_utc >= start_time:
                     filtered_btc_data.append(hist_point)
 
             if not filtered_btc_data:
-                print('[WARN] No BTC data after system start time')
+                print(f'[WARN] No BTC data after start time: {start_time_utc_str}')
             else:
                 # 使用过滤后的最早价格作为初始价格
                 btc_initial_price = filtered_btc_data[0]['price']
