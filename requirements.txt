@@ -8,4 +8,4 @@ python-socketio==5.10.0
 eventlet==0.33.3
 python-dotenv==1.0.0
 Pillow>=10.0.0
-
+ccxt>=3.0.0
